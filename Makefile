@@ -8,7 +8,7 @@ build:
 	go build -o bin/$(BINARY) .
 
 test:
-	go test ./... -count=1 -timeout=120s -v
+	go test ./... -count=1 -timeout=30s -v
 
 vet:
 	go vet ./...

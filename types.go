@@ -23,6 +23,7 @@ type InfraSet struct {
 	OIDCProviders []string
 	Instances     int
 	Age           time.Duration
+	Orphaned      bool // true when discovered from IAM/OIDC without a VPC
 
 	// Prow correlation
 	TestType  string // "node-pool", "create-cluster", "control-plane-upgrade", etc.
@@ -94,12 +95,12 @@ func DefaultConfig() Config {
 		ProtectedUsers: []string{
 			"aabdelre", "agarcial", "ahmed", "alamela", "alesross",
 			"bclement", "brcox", "celebdor", "cewong",
-			"dario", "dari2o", "dmace",
+			"dario", "dmace",
 			"glipceanu",
 			"jiezhao", "jparrill",
 			"mbhalodi", "mbrown", "meha", "mgencur", "mulham", "mraee",
 			"rkshirsa",
-			"sdminonne", "sjenning",
+			"sdminonne", "sjenning", "sminonne",
 			"tsegura",
 			"vismishr",
 		},
