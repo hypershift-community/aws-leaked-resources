@@ -152,13 +152,14 @@ func newScanner(ctx context.Context, cfg Config) (*Scanner, error) {
 	}
 
 	return &Scanner{
-		EC2:     ec2.NewFromConfig(awsCfg),
-		ELBv2:   elbv2.NewFromConfig(awsCfg),
-		Route53: route53.NewFromConfig(awsCfg),
-		IAM:     iam.NewFromConfig(awsCfg),
-		S3:      s3.NewFromConfig(awsCfg),
-		Config:  cfg,
-		Now:     time.Now,
+		EC2:        ec2.NewFromConfig(awsCfg),
+		ELBv2:      elbv2.NewFromConfig(awsCfg),
+		Route53:    route53.NewFromConfig(awsCfg),
+		IAM:        iam.NewFromConfig(awsCfg),
+		S3:         s3.NewFromConfig(awsCfg),
+		HTTPClient: nil, // uses default 5s-timeout client for OIDC checks
+		Config:     cfg,
+		Now:        time.Now,
 	}, nil
 }
 
@@ -180,7 +181,7 @@ func openReportFile(outputDir, prefix string) (io.Writer, func(), error) {
 	}
 
 	fmt.Fprintf(os.Stderr, "Report file: %s\n", filename)
-	return f, func() { f.Close() }, nil
+	return f, func() { _ = f.Close() }, nil
 }
 
 func tee(a, b io.Writer) io.Writer {
@@ -267,12 +268,12 @@ func runDelete(ctx context.Context, cfg Config) error {
 
 	leaked := FilterLeaked(results)
 	if len(leaked) == 0 {
-		fmt.Fprintln(out, "\nNo leaked resources to delete.")
+		_, _ = fmt.Fprintln(out, "\nNo leaked resources to delete.")
 		return nil
 	}
 
 	if cfg.Limit > 0 && len(leaked) > cfg.Limit {
-		fmt.Fprintf(out, "\nLimiting to %d of %d leaked infra sets (--limit %d).\n", cfg.Limit, len(leaked), cfg.Limit)
+		_, _ = fmt.Fprintf(out, "\nLimiting to %d of %d leaked infra sets (--limit %d).\n", cfg.Limit, len(leaked), cfg.Limit)
 		leaked = leaked[:cfg.Limit]
 	}
 
@@ -284,7 +285,7 @@ func runDelete(ctx context.Context, cfg Config) error {
 	}
 
 	if cfg.DryRun {
-		fmt.Fprintf(out, "\n[DRY RUN] Would delete %d infra sets (%d VPCs, %d zones).\n", len(leaked), totalVPCs, totalZones)
+		_, _ = fmt.Fprintf(out, "\n[DRY RUN] Would delete %d infra sets (%d VPCs, %d zones).\n", len(leaked), totalVPCs, totalZones)
 		return nil
 	}
 

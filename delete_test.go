@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -46,7 +47,17 @@ func (t *trackingEC2) DescribeInstances(_ context.Context, _ *ec2.DescribeInstan
 func (t *trackingEC2) DescribeVpcEndpoints(_ context.Context, _ *ec2.DescribeVpcEndpointsInput, _ ...func(*ec2.Options)) (*ec2.DescribeVpcEndpointsOutput, error) {
 	return &ec2.DescribeVpcEndpointsOutput{VpcEndpoints: t.endpoints}, nil
 }
-func (t *trackingEC2) DescribeNatGateways(_ context.Context, _ *ec2.DescribeNatGatewaysInput, _ ...func(*ec2.Options)) (*ec2.DescribeNatGatewaysOutput, error) {
+func (t *trackingEC2) DescribeNatGateways(_ context.Context, input *ec2.DescribeNatGatewaysInput, _ ...func(*ec2.Options)) (*ec2.DescribeNatGatewaysOutput, error) {
+	// When the drain loop checks for state=deleting, return empty to avoid 60s waits.
+	for _, f := range input.Filter {
+		if aws.ToString(f.Name) == "state" {
+			for _, v := range f.Values {
+				if v == "deleting" {
+					return &ec2.DescribeNatGatewaysOutput{}, nil
+				}
+			}
+		}
+	}
 	return &ec2.DescribeNatGatewaysOutput{NatGateways: t.natGateways}, nil
 }
 func (t *trackingEC2) DescribeInternetGateways(_ context.Context, _ *ec2.DescribeInternetGatewaysInput, _ ...func(*ec2.Options)) (*ec2.DescribeInternetGatewaysOutput, error) {
@@ -188,6 +199,9 @@ func (t *trackingIAM) GetOpenIDConnectProvider(_ context.Context, _ *iam.GetOpen
 }
 func (t *trackingIAM) ListRoles(_ context.Context, _ *iam.ListRolesInput, _ ...func(*iam.Options)) (*iam.ListRolesOutput, error) {
 	return &iam.ListRolesOutput{}, nil
+}
+func (t *trackingIAM) GetRole(_ context.Context, _ *iam.GetRoleInput, _ ...func(*iam.Options)) (*iam.GetRoleOutput, error) {
+	return nil, fmt.Errorf("not implemented")
 }
 func (t *trackingIAM) DeleteOpenIDConnectProvider(_ context.Context, input *iam.DeleteOpenIDConnectProviderInput, _ ...func(*iam.Options)) (*iam.DeleteOpenIDConnectProviderOutput, error) {
 	t.deletedOIDC = append(t.deletedOIDC, aws.ToString(input.OpenIDConnectProviderArn))

@@ -2,7 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"strings"
@@ -15,16 +19,19 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/iam"
 	"github.com/aws/aws-sdk-go-v2/service/route53"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	smithy "github.com/aws/smithy-go"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
 type Scanner struct {
-	EC2     EC2API
-	ELBv2   ELBv2API
-	Route53 Route53API
-	IAM     IAMAPI
-	S3      S3API
-	Config  Config
-	Now     func() time.Time
+	EC2        EC2API
+	ELBv2      ELBv2API
+	Route53    Route53API
+	IAM        IAMAPI
+	S3         S3API
+	HTTPClient *http.Client // for non-S3 OIDC liveness checks
+	Config     Config
+	Now        func() time.Time
 
 	lbCache  []lbCacheEntry
 	lbCached bool
@@ -119,6 +126,15 @@ func (s *Scanner) Scan(ctx context.Context) ([]InfraSet, error) {
 			continue
 		}
 
+		// Shared VPC safety: even if this infra ID has no instances,
+		// check if any of its VPCs have active instances from other infra IDs.
+		if verdict, reason := s.checkVPCActiveInstances(ctx, vpcInfos); verdict != "" {
+			infraSet.Verdict = verdict
+			infraSet.VerdictReason = reason
+			results = append(results, infraSet)
+			continue
+		}
+
 		// If the infraID doesn't match any known CI pattern (hex ID or test name),
 		// mark as UNCERTAIN — it could be a developer cluster or unknown origin.
 		testType, _ := InferTestType(infraID)
@@ -152,6 +168,22 @@ func (s *Scanner) Scan(ctx context.Context) ([]InfraSet, error) {
 		}
 
 		results = append(results, infraSet)
+	}
+
+	// Orphaned resource scan: find IAM roles and OIDC providers
+	// whose infra ID was not discovered from any VPC.
+	if s.Config.Target == "" {
+		knownInfraIDs := make(map[string]bool, len(grouped))
+		for infraID := range grouped {
+			knownInfraIDs[infraID] = true
+		}
+		orphaned, err := s.scanOrphanedResources(ctx, knownInfraIDs, oidcMap)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  WARN: orphaned resource scan failed: %v\n", err)
+		} else if len(orphaned) > 0 {
+			fmt.Fprintf(os.Stderr, "  Found %d orphaned infra sets (no VPC)\n", len(orphaned))
+			results = append(results, orphaned...)
+		}
 	}
 
 	return results, nil
@@ -302,8 +334,9 @@ func (s *Scanner) checkAge(vpcs []VPCInfo, minAge time.Duration) (Verdict, strin
 
 type oidcProviderInfo struct {
 	ARN    string
-	Bucket string
+	Bucket string // empty for non-S3 providers
 	Region string
+	URL    string // full URL for non-S3 providers (e.g., "oidc.op1.openshiftapps.com/infraID")
 }
 
 func (s *Scanner) fetchOIDCProviders(ctx context.Context) (map[string]oidcProviderInfo, error) {
@@ -314,22 +347,46 @@ func (s *Scanner) fetchOIDCProviders(ctx context.Context) (map[string]oidcProvid
 		return nil, err
 	}
 
-	re := regexp.MustCompile(`([^.]+)\.s3\.([^.]+)\.amazonaws\.com/(.+)`)
+	// Standard: bucket.s3[.dualstack].region.amazonaws.com[.cn]/infraID
+	reStandard := regexp.MustCompile(`([^.]+)\.s3\.(?:dualstack\.)?([^.]+)\.amazonaws\.com(?:\.cn)?/(.+)`)
+	// Legacy us-east-1 path-style: s3.amazonaws.com/bucket/infraID
+	reLegacy := regexp.MustCompile(`s3\.amazonaws\.com/([^/]+)/(.+)`)
+
 	for _, p := range out.OpenIDConnectProviderList {
 		arn := aws.ToString(p.Arn)
 		parts := strings.SplitN(arn, "oidc-provider/", 2)
 		if len(parts) < 2 {
 			continue
 		}
-		m := re.FindStringSubmatch(parts[1])
-		if m == nil {
+		providerURL := parts[1]
+		if m := reStandard.FindStringSubmatch(providerURL); m != nil {
+			infraID := m[3]
+			result[infraID] = oidcProviderInfo{
+				ARN:    arn,
+				Bucket: m[1],
+				Region: m[2],
+			}
 			continue
 		}
-		infraID := m[3]
-		result[infraID] = oidcProviderInfo{
-			ARN:    arn,
-			Bucket: m[1],
-			Region: m[2],
+		if m := reLegacy.FindStringSubmatch(providerURL); m != nil {
+			infraID := m[2]
+			result[infraID] = oidcProviderInfo{
+				ARN:    arn,
+				Bucket: m[1],
+				Region: "us-east-1",
+			}
+			continue
+		}
+
+		// Non-S3 OIDC provider (e.g., oidc.op1.openshiftapps.com/infraID)
+		// Extract infraID from the URL path.
+		slashIdx := strings.Index(providerURL, "/")
+		if slashIdx > 0 && slashIdx < len(providerURL)-1 {
+			infraID := providerURL[slashIdx+1:]
+			result[infraID] = oidcProviderInfo{
+				ARN: arn,
+				URL: providerURL,
+			}
 		}
 	}
 
@@ -338,6 +395,14 @@ func (s *Scanner) fetchOIDCProviders(ctx context.Context) (map[string]oidcProvid
 
 func (s *Scanner) checkOIDC(ctx context.Context, infraID string, oidcMap map[string]oidcProviderInfo) (Verdict, string) {
 	if info, ok := oidcMap[infraID]; ok {
+		// Non-S3 provider: check HTTPS endpoint liveness
+		if info.Bucket == "" && info.URL != "" {
+			if verdict, reason := s.checkHTTPSOIDC(ctx, info.URL); verdict != "" {
+				return verdict, reason
+			}
+			return "", ""
+		}
+
 		isAllowed := false
 		for _, bucket := range s.Config.AllowedBuckets {
 			if strings.HasPrefix(info.Bucket, bucket) {
@@ -349,14 +414,22 @@ func (s *Scanner) checkOIDC(ctx context.Context, infraID string, oidcMap map[str
 			return "", ""
 		}
 
-		if s.s3DocExists(ctx, info.Bucket, infraID) {
+		exists, err := s.s3DocExists(ctx, info.Bucket, infraID)
+		if err != nil {
+			return VerdictUncertain, fmt.Sprintf("could not verify S3 OIDC doc: %v", err)
+		}
+		if exists {
 			return VerdictActive, fmt.Sprintf("S3 OIDC doc exists (bucket=%s)", info.Bucket)
 		}
 		return "", ""
 	}
 
 	for _, bucket := range s.Config.AllowedBuckets {
-		if s.s3DocExists(ctx, bucket, infraID) {
+		exists, err := s.s3DocExists(ctx, bucket, infraID)
+		if err != nil {
+			return VerdictUncertain, fmt.Sprintf("could not verify S3 OIDC doc: %v", err)
+		}
+		if exists {
 			return VerdictActive, fmt.Sprintf("S3 OIDC doc found in bucket %s", bucket)
 		}
 	}
@@ -364,12 +437,60 @@ func (s *Scanner) checkOIDC(ctx context.Context, infraID string, oidcMap map[str
 	return "", ""
 }
 
-func (s *Scanner) s3DocExists(ctx context.Context, bucket, infraID string) bool {
+// checkHTTPSOIDC performs an HTTPS GET to the OIDC discovery endpoint.
+// Returns (VerdictActive, reason) if the endpoint responds with HTTP 200,
+// ("", "") if the endpoint is definitively dead (404/410),
+// or (VerdictUncertain, reason) if the result is ambiguous (network error, 5xx, 403, etc.).
+func (s *Scanner) checkHTTPSOIDC(ctx context.Context, providerURL string) (Verdict, string) {
+	client := s.HTTPClient
+	if client == nil {
+		client = &http.Client{Timeout: 5 * time.Second}
+	}
+
+	// providerURL is "host/infraID" — the discovery document lives under the full issuer URL.
+	endpoint := fmt.Sprintf("https://%s/.well-known/openid-configuration", strings.TrimRight(providerURL, "/"))
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return VerdictUncertain, fmt.Sprintf("could not reach OIDC endpoint: %v", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return VerdictUncertain, fmt.Sprintf("could not reach OIDC endpoint: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		return VerdictActive, fmt.Sprintf("HTTPS OIDC endpoint is live (%s)", providerURL)
+	}
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
+		return "", ""
+	}
+	return VerdictUncertain, fmt.Sprintf("OIDC endpoint returned HTTP %d", resp.StatusCode)
+}
+
+func (s *Scanner) s3DocExists(ctx context.Context, bucket, infraID string) (bool, error) {
 	_, err := s.S3.HeadObject(ctx, &s3.HeadObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(infraID + "/.well-known/openid-configuration"),
 	})
-	return err == nil
+	if err == nil {
+		return true, nil
+	}
+	// Definitive 404: object does not exist
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		code := apiErr.ErrorCode()
+		if code == "NotFound" || code == "NoSuchKey" || code == "404" {
+			return false, nil
+		}
+	}
+	var respErr *smithyhttp.ResponseError
+	if errors.As(err, &respErr) && respErr.HTTPStatusCode() == 404 {
+		return false, nil
+	}
+	// Ambiguous error (403, throttle, wrong region, etc.)
+	return false, err
 }
 
 func (s *Scanner) checkEC2Instances(ctx context.Context, infraID string) (Verdict, string, int) {
@@ -698,6 +819,340 @@ func (s *Scanner) countLBsForVPC(ctx context.Context, vpcID string) int {
 		}
 	}
 	return count
+}
+
+// checkVPCActiveInstances checks if any of the given VPCs have running instances
+// from any infra ID (not just the one being classified). This protects shared VPCs
+// where one cluster's resources are being cleaned up but another cluster is still active.
+func (s *Scanner) checkVPCActiveInstances(ctx context.Context, vpcs []VPCInfo) (Verdict, string) {
+	for _, vpc := range vpcs {
+		out, err := s.EC2.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
+			Filters: []ec2types.Filter{
+				{
+					Name:   aws.String("vpc-id"),
+					Values: []string{vpc.VPCID},
+				},
+				{
+					Name:   aws.String("instance-state-name"),
+					Values: []string{"pending", "running", "stopping", "stopped", "shutting-down"},
+				},
+			},
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "    WARN: DescribeInstances failed for VPC %s: %v\n", vpc.VPCID, err)
+			return VerdictUncertain, fmt.Sprintf("could not verify VPC %s active instances: %v", vpc.VPCID, err)
+		}
+		count := 0
+		for _, r := range out.Reservations {
+			count += len(r.Instances)
+		}
+		if count > 0 {
+			return VerdictActive, fmt.Sprintf("VPC %s has %d active instances from other infra IDs", vpc.VPCID, count)
+		}
+	}
+	return "", ""
+}
+
+// scanOrphanedResources discovers IAM roles and OIDC providers whose infra ID
+// was not found in any VPC. These are "orphaned" resources left behind after
+// the VPC was already deleted.
+//
+//nolint:gocyclo // orchestrates multiple AWS API calls for orphan detection
+func (s *Scanner) scanOrphanedResources(ctx context.Context, knownInfraIDs map[string]bool, oidcMap map[string]oidcProviderInfo) ([]InfraSet, error) {
+	orphanedSets := make(map[string]*InfraSet)
+
+	// Track the oldest IAM role creation date per infra ID for age gating.
+	orphanAge := make(map[string]time.Time)
+
+	// Track do-not-delete protection from IAM role tags.
+	orphanDoNotDelete := make(map[string]bool)
+
+	// Scan IAM roles for unknown infra IDs
+	var nextMarker *string
+	for {
+		input := &iam.ListRolesInput{}
+		if nextMarker != nil {
+			input.Marker = nextMarker
+		}
+		out, err := s.IAM.ListRoles(ctx, input)
+		if err != nil {
+			return nil, fmt.Errorf("listing IAM roles: %w", err)
+		}
+
+		for _, role := range out.Roles {
+			roleName := aws.ToString(role.RoleName)
+			for _, suffix := range iamRoleSuffixes {
+				if strings.HasSuffix(roleName, suffix) {
+					prefix := strings.TrimSuffix(roleName, suffix)
+					if prefix != "" && !knownInfraIDs[prefix] {
+						if _, exists := orphanedSets[prefix]; !exists {
+							orphanedSets[prefix] = &InfraSet{
+								InfraID:  prefix,
+								Orphaned: true,
+							}
+						}
+						orphanedSets[prefix].IAMRoles = append(orphanedSets[prefix].IAMRoles, roleName)
+						// Track the oldest (earliest) role creation date
+						if role.CreateDate != nil {
+							if existing, ok := orphanAge[prefix]; !ok || role.CreateDate.Before(existing) {
+								orphanAge[prefix] = *role.CreateDate
+							}
+						}
+						// Check IAM role tags for do-not-delete protection
+						for _, tag := range role.Tags {
+							if aws.ToString(tag.Key) == TagDoNotDelete && aws.ToString(tag.Value) == "true" {
+								orphanDoNotDelete[prefix] = true
+							}
+						}
+					}
+				}
+			}
+		}
+
+		if !out.IsTruncated {
+			break
+		}
+		nextMarker = out.Marker
+	}
+
+	// Add OIDC providers for unknown infra IDs
+	for infraID, info := range oidcMap {
+		if knownInfraIDs[infraID] {
+			continue
+		}
+		if _, exists := orphanedSets[infraID]; !exists {
+			orphanedSets[infraID] = &InfraSet{
+				InfraID:  infraID,
+				Orphaned: true,
+			}
+		}
+		orphanedSets[infraID].OIDCProviders = append(orphanedSets[infraID].OIDCProviders, info.ARN)
+
+		// If this orphan has no IAM role age, try to get the OIDC provider's CreateDate.
+		if _, hasAge := orphanAge[infraID]; !hasAge {
+			if out, err := s.IAM.GetOpenIDConnectProvider(ctx, &iam.GetOpenIDConnectProviderInput{
+				OpenIDConnectProviderArn: aws.String(info.ARN),
+			}); err == nil && out.CreateDate != nil {
+				orphanAge[infraID] = *out.CreateDate
+			}
+		}
+	}
+
+	// Classify each orphaned infra set through the same gates
+	var results []InfraSet
+	for _, infra := range orphanedSets {
+		// Protection check: do-not-delete tag on IAM roles
+		if orphanDoNotDelete[infra.InfraID] {
+			infra.Verdict = VerdictProtected
+			infra.VerdictReason = "do-not-delete=true on IAM role"
+			results = append(results, *infra)
+			continue
+		}
+
+		// Protection check (user names in infraID)
+		if verdict, reason := s.checkProtection(infra.InfraID, nil); verdict != "" {
+			infra.Verdict = verdict
+			infra.VerdictReason = reason
+			results = append(results, *infra)
+			continue
+		}
+
+		// Age gate: use the oldest IAM role creation date
+		if created, ok := orphanAge[infra.InfraID]; ok {
+			age := s.now().Sub(created)
+			infra.Age = age
+			if age < s.Config.MinAge {
+				infra.Verdict = VerdictTooYoung
+				infra.VerdictReason = fmt.Sprintf("orphaned resources are %s old (min: %s)", age.Round(time.Minute), s.Config.MinAge)
+				results = append(results, *infra)
+				continue
+			}
+		} else {
+			infra.Verdict = VerdictUncertain
+			infra.VerdictReason = "orphaned resources with no determinable age"
+			results = append(results, *infra)
+			continue
+		}
+
+		// OIDC check
+		if verdict, reason := s.checkOIDC(ctx, infra.InfraID, oidcMap); verdict != "" {
+			infra.Verdict = verdict
+			infra.VerdictReason = reason
+			results = append(results, *infra)
+			continue
+		}
+
+		// EC2 instance check (tagged with this infra ID)
+		if verdict, reason, count := s.checkEC2Instances(ctx, infra.InfraID); verdict != "" {
+			infra.Instances = count
+			infra.Verdict = verdict
+			infra.VerdictReason = reason
+			results = append(results, *infra)
+			continue
+		}
+
+		// CI pattern check
+		testType, _ := InferTestType(infra.InfraID)
+		if testType == "" {
+			infra.Verdict = VerdictUncertain
+			infra.VerdictReason = fmt.Sprintf("orphaned resources, infraID %q does not match CI patterns", infra.InfraID)
+			results = append(results, *infra)
+			continue
+		}
+
+		// Trust policy fallback: verify region ownership and OIDC doc
+		if len(infra.IAMRoles) > 0 {
+			if tp, found := s.checkOIDCFromTrustPolicy(ctx, infra.IAMRoles); found {
+				// Non-S3 issuer: check the HTTPS endpoint liveness
+				if tp.Bucket == "" && tp.URL != "" {
+					if verdict, reason := s.checkHTTPSOIDC(ctx, tp.URL); verdict != "" {
+						infra.Verdict = verdict
+						infra.VerdictReason = fmt.Sprintf("trust policy OIDC: %s", reason)
+						results = append(results, *infra)
+						continue
+					}
+					// HTTPS endpoint definitively dead (404/410) → LEAKED
+					infra.Verdict = VerdictLeaked
+					infra.VerdictReason = "orphaned: non-S3 OIDC endpoint is dead, no EC2 instances"
+					results = append(results, *infra)
+					continue
+				}
+
+				if tp.Region != s.Config.Region {
+					infra.Verdict = VerdictUncertain
+					infra.VerdictReason = fmt.Sprintf("trust policy references region %s, scanner is in %s", tp.Region, s.Config.Region)
+					results = append(results, *infra)
+					continue
+				}
+				exists, err := s.s3DocExists(ctx, tp.Bucket, infra.InfraID)
+				if err != nil {
+					infra.Verdict = VerdictUncertain
+					infra.VerdictReason = fmt.Sprintf("could not verify S3 OIDC doc: %v", err)
+					results = append(results, *infra)
+					continue
+				}
+				if exists {
+					infra.Verdict = VerdictActive
+					infra.VerdictReason = fmt.Sprintf("S3 OIDC doc found via trust policy (bucket=%s)", tp.Bucket)
+					results = append(results, *infra)
+					continue
+				}
+				// Region confirmed ours, S3 doc confirmed absent → LEAKED
+				infra.Verdict = VerdictLeaked
+				infra.VerdictReason = "orphaned: region confirmed, S3 OIDC doc absent, no EC2 instances"
+				results = append(results, *infra)
+				continue
+			}
+		}
+		// No trust policy found → can't verify regional ownership
+		infra.Verdict = VerdictUncertain
+		infra.VerdictReason = "orphaned: cannot verify regional ownership from trust policy"
+		results = append(results, *infra)
+	}
+
+	return results, nil
+}
+
+// trustPolicyResult holds the OIDC issuer information extracted from a trust policy.
+type trustPolicyResult struct {
+	Bucket string // S3 bucket name (empty for non-S3 issuers)
+	Region string // AWS region from S3 URL
+	URL    string // full issuer URL for non-S3 issuers
+}
+
+// checkOIDCFromTrustPolicy reads the trust policy from one of the given IAM roles
+// and extracts the OIDC issuer URL to determine the S3 bucket and region.
+// This is a fallback for orphaned infra sets where the OIDC provider is already deleted.
+//
+// Handles multiple S3 URL formats:
+//   - bucket.s3.region.amazonaws.com (standard)
+//   - bucket.s3.dualstack.region.amazonaws.com (dualstack)
+//   - bucket.s3.region.amazonaws.com.cn (China regions)
+//   - s3.amazonaws.com/bucket (us-east-1 legacy path-style)
+//
+// Also handles non-S3 OIDC issuers (e.g., oidc.op1.openshiftapps.com)
+// and Statement as either a JSON array or a single object.
+func (s *Scanner) checkOIDCFromTrustPolicy(ctx context.Context, roles []string) (result *trustPolicyResult, found bool) {
+	// Standard format: bucket.s3[.dualstack].region.amazonaws.com[.cn]
+	reStandard := regexp.MustCompile(`([^.]+)\.s3\.(?:dualstack\.)?([^.]+)\.amazonaws\.com(?:\.cn)?`)
+	// Legacy us-east-1 path-style: s3.amazonaws.com/bucket
+	reLegacy := regexp.MustCompile(`s3\.amazonaws\.com/([^/]+)`)
+
+	for _, roleName := range roles {
+		out, err := s.IAM.GetRole(ctx, &iam.GetRoleInput{
+			RoleName: aws.String(roleName),
+		})
+		if err != nil {
+			continue
+		}
+		if out.Role == nil || out.Role.AssumeRolePolicyDocument == nil {
+			continue
+		}
+
+		// The trust policy document is URL-encoded
+		policyDoc, err := url.QueryUnescape(aws.ToString(out.Role.AssumeRolePolicyDocument))
+		if err != nil {
+			continue
+		}
+
+		issuerKeys := extractTrustPolicyIssuerKeys(policyDoc)
+		for _, key := range issuerKeys {
+			// Try standard S3 format
+			if m := reStandard.FindStringSubmatch(key); m != nil {
+				return &trustPolicyResult{Bucket: m[1], Region: m[2]}, true
+			}
+			// Try legacy us-east-1 path-style
+			if m := reLegacy.FindStringSubmatch(key); m != nil {
+				return &trustPolicyResult{Bucket: m[1], Region: "us-east-1"}, true
+			}
+			// Non-S3 issuer: extract the host portion (before ":sub" suffix)
+			issuerURL := key
+			if idx := strings.Index(issuerURL, ":"); idx > 0 {
+				issuerURL = issuerURL[:idx]
+			}
+			if strings.Contains(issuerURL, ".") && !strings.Contains(issuerURL, "amazonaws.com") {
+				return &trustPolicyResult{URL: issuerURL}, true
+			}
+		}
+	}
+	return nil, false
+}
+
+// extractTrustPolicyIssuerKeys parses a trust policy JSON document and returns
+// all condition keys from StringEquals/StringLike conditions, which contain OIDC issuer URLs.
+// Handles Statement as either a JSON array or a single object.
+func extractTrustPolicyIssuerKeys(policyDoc string) []string {
+	// Try parsing Statement as array first, then as single object
+	type statement struct {
+		Condition map[string]map[string]interface{} `json:"Condition"`
+	}
+
+	var statements []statement
+
+	var arrayPolicy struct {
+		Statement []statement `json:"Statement"`
+	}
+	if err := json.Unmarshal([]byte(policyDoc), &arrayPolicy); err == nil {
+		statements = arrayPolicy.Statement
+	} else {
+		// Try single-object Statement
+		var objectPolicy struct {
+			Statement statement `json:"Statement"`
+		}
+		if err := json.Unmarshal([]byte(policyDoc), &objectPolicy); err == nil {
+			statements = []statement{objectPolicy.Statement}
+		}
+	}
+
+	var keys []string
+	for _, stmt := range statements {
+		for _, condMap := range stmt.Condition {
+			for key := range condMap {
+				keys = append(keys, key)
+			}
+		}
+	}
+	return keys
 }
 
 // Tag constants, helpers, and utility functions are in tags.go
