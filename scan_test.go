@@ -18,6 +18,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/route53"
 	route53types "github.com/aws/aws-sdk-go-v2/service/route53/types"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	smithy "github.com/aws/smithy-go"
 )
 
 // mockEC2 implements EC2API for testing.
@@ -229,7 +230,16 @@ func (m *mockS3) HeadObject(_ context.Context, input *s3.HeadObjectInput, _ ...f
 	if m.existingKeys != nil && m.existingKeys[key] {
 		return &s3.HeadObjectOutput{}, nil
 	}
-	return nil, fmt.Errorf("NoSuchKey")
+	return nil, &smithy.GenericAPIError{Code: "NotFound", Message: "not found"}
+}
+
+// mockS3Error implements S3API and always returns the configured error.
+type mockS3Error struct {
+	err error
+}
+
+func (m *mockS3Error) HeadObject(_ context.Context, _ *s3.HeadObjectInput, _ ...func(*s3.Options)) (*s3.HeadObjectOutput, error) {
+	return nil, m.err
 }
 
 func makeVPC(vpcID, name, infraID string, isDefault bool) ec2types.Vpc {
@@ -1351,10 +1361,32 @@ func TestScanOrphanedResources(t *testing.T) {
 			},
 		}
 
+		// Trust policy references us-east-1 (matching DefaultConfig().Region)
+		// so the scanner can confirm regional ownership and reach LEAKED.
+		trustPolicy := url.QueryEscape(`{
+			"Version": "2012-10-17",
+			"Statement": [{
+				"Effect": "Allow",
+				"Principal": {"Federated": "arn:aws:iam::123456789012:oidc-provider/hypershift-ci-oidc.s3.us-east-1.amazonaws.com/fedcba0987654321fedc"},
+				"Action": "sts:AssumeRoleWithWebIdentity",
+				"Condition": {
+					"StringEquals": {
+						"hypershift-ci-oidc.s3.us-east-1.amazonaws.com/fedcba0987654321fedc:sub": "system:serviceaccount:kube-system:control-plane-operator"
+					}
+				}
+			}]
+		}`)
+
 		iamClient := &mockIAM{
 			roles: []iamtypes.Role{
 				{RoleName: aws.String("fedcba0987654321fedc-cloud-controller"), CreateDate: &oldRoleDate},
 				{RoleName: aws.String("fedcba0987654321fedc-node-pool"), CreateDate: &oldRoleDate},
+			},
+			roleMap: map[string]*iamtypes.Role{
+				"fedcba0987654321fedc-cloud-controller": {
+					RoleName:                 aws.String("fedcba0987654321fedc-cloud-controller"),
+					AssumeRolePolicyDocument: aws.String(trustPolicy),
+				},
 			},
 		}
 
@@ -1387,7 +1419,7 @@ func TestScanOrphanedResources(t *testing.T) {
 			t.Error("expected Orphaned=true")
 		}
 		if orphaned.Verdict != VerdictLeaked {
-			t.Errorf("got verdict %q, want LEAKED", orphaned.Verdict)
+			t.Errorf("got verdict %q, want LEAKED (reason: %s)", orphaned.Verdict, orphaned.VerdictReason)
 		}
 		if len(orphaned.IAMRoles) != 2 {
 			t.Errorf("expected 2 IAM roles, got %d", len(orphaned.IAMRoles))
@@ -1503,6 +1535,111 @@ func TestScanOrphanedResources(t *testing.T) {
 	})
 }
 
+func TestOrphanDoNotDeleteTag(t *testing.T) {
+	t.Run("When orphaned IAM role has do-not-delete tag, it should be PROTECTED", func(t *testing.T) {
+		now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+		oldRoleDate := now.Add(-48 * time.Hour)
+
+		iamClient := &mockIAM{
+			roles: []iamtypes.Role{
+				{
+					RoleName:   aws.String("create-cluster-dnd12-cloud-controller"),
+					CreateDate: &oldRoleDate,
+					Tags: []iamtypes.Tag{
+						{Key: aws.String("hypershift.openshift.io/do-not-delete"), Value: aws.String("true")},
+					},
+				},
+			},
+		}
+
+		scanner := &Scanner{
+			EC2:     &mockEC2{},
+			ELBv2:   &mockELBv2{},
+			Route53: &mockRoute53{},
+			IAM:     iamClient,
+			S3:      &mockS3{existingKeys: map[string]bool{}},
+			Config:  DefaultConfig(),
+			Now:     func() time.Time { return now },
+		}
+
+		results, err := scanner.Scan(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var orphaned *InfraSet
+		for i := range results {
+			if results[i].InfraID == "create-cluster-dnd12" {
+				orphaned = &results[i]
+			}
+		}
+		if orphaned == nil {
+			t.Fatal("expected to find orphaned infra set 'create-cluster-dnd12'")
+		}
+		if orphaned.Verdict != VerdictProtected {
+			t.Errorf("got verdict %q, want PROTECTED (reason: %s)", orphaned.Verdict, orphaned.VerdictReason)
+		}
+	})
+}
+
+func TestOrphanOIDCOnlyAge(t *testing.T) {
+	t.Run("When OIDC-only orphan has CreateDate from provider, it should use it for age gating", func(t *testing.T) {
+		now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+		youngDate := now.Add(-2 * time.Hour)
+
+		// Mock OIDC provider with a young CreateDate
+		iamClient := &mockIAMWithOIDCDate{
+			mockIAM: mockIAM{
+				providers: []iamtypes.OpenIDConnectProviderListEntry{
+					{Arn: aws.String("arn:aws:iam::123456789012:oidc-provider/oidc.op1.openshiftapps.com/create-cluster-oidc1")},
+				},
+			},
+			oidcCreateDate: &youngDate,
+		}
+
+		scanner := &Scanner{
+			EC2:     &mockEC2{},
+			ELBv2:   &mockELBv2{},
+			Route53: &mockRoute53{},
+			IAM:     iamClient,
+			S3:      &mockS3{existingKeys: map[string]bool{}},
+			Config:  DefaultConfig(),
+			Now:     func() time.Time { return now },
+		}
+
+		results, err := scanner.Scan(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var orphaned *InfraSet
+		for i := range results {
+			if results[i].InfraID == "create-cluster-oidc1" {
+				orphaned = &results[i]
+			}
+		}
+		if orphaned == nil {
+			t.Fatal("expected to find orphaned infra set 'create-cluster-oidc1'")
+		}
+		// Young OIDC-only orphan should be TOO_YOUNG, not UNCERTAIN
+		if orphaned.Verdict != VerdictTooYoung {
+			t.Errorf("got verdict %q, want TOO_YOUNG (reason: %s)", orphaned.Verdict, orphaned.VerdictReason)
+		}
+	})
+}
+
+// mockIAMWithOIDCDate extends mockIAM to return CreateDate from GetOpenIDConnectProvider.
+type mockIAMWithOIDCDate struct {
+	mockIAM
+	oidcCreateDate *time.Time
+}
+
+func (m *mockIAMWithOIDCDate) GetOpenIDConnectProvider(_ context.Context, _ *iam.GetOpenIDConnectProviderInput, _ ...func(*iam.Options)) (*iam.GetOpenIDConnectProviderOutput, error) {
+	return &iam.GetOpenIDConnectProviderOutput{
+		CreateDate: m.oidcCreateDate,
+	}, nil
+}
+
 func TestNonS3OIDCProvider(t *testing.T) {
 	t.Run("When OIDC provider uses HTTPS URL and endpoint is live, it should be ACTIVE", func(t *testing.T) {
 		// Create a test HTTPS server that returns 200 only for the correct per-infra discovery path
@@ -1555,6 +1692,55 @@ func TestNonS3OIDCProvider(t *testing.T) {
 		}
 		if found.Verdict != VerdictActive {
 			t.Errorf("got verdict %q, want ACTIVE (reason: %s)", found.Verdict, found.VerdictReason)
+		}
+	})
+
+	t.Run("When OIDC provider uses HTTPS URL and endpoint returns 500, it should be UNCERTAIN", func(t *testing.T) {
+		// Create a test server that returns 500 for all requests
+		ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_ = r
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		defer ts.Close()
+
+		tsURL, _ := url.Parse(ts.URL)
+
+		now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+		old := now.Add(-48 * time.Hour)
+
+		providerARN := fmt.Sprintf("arn:aws:iam::123456789012:oidc-provider/%s/create-cluster-err12", tsURL.Host)
+
+		scanner := &Scanner{
+			EC2:   &mockEC2{vpcs: []ec2types.Vpc{makeVPCWithAge("vpc-test", "create-cluster-err12-vpc", "create-cluster-err12", old)}},
+			ELBv2: &mockELBv2{},
+			Route53: &mockRoute53{},
+			IAM: &mockIAM{
+				providers: []iamtypes.OpenIDConnectProviderListEntry{
+					{Arn: aws.String(providerARN)},
+				},
+			},
+			S3:         &mockS3{existingKeys: map[string]bool{}},
+			HTTPClient: ts.Client(),
+			Config:     DefaultConfig(),
+			Now:        func() time.Time { return now },
+		}
+
+		results, err := scanner.Scan(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var found *InfraSet
+		for i := range results {
+			if results[i].InfraID == "create-cluster-err12" {
+				found = &results[i]
+			}
+		}
+		if found == nil {
+			t.Fatal("expected to find infra set 'create-cluster-err12'")
+		}
+		if found.Verdict != VerdictUncertain {
+			t.Errorf("got verdict %q, want UNCERTAIN (reason: %s)", found.Verdict, found.VerdictReason)
 		}
 	})
 
@@ -1638,6 +1824,62 @@ func TestFetchOIDCProviders_NonS3(t *testing.T) {
 	})
 }
 
+func TestS3DocExists(t *testing.T) {
+	t.Run("When S3 returns 403 Forbidden, s3DocExists should return error", func(t *testing.T) {
+		scanner := &Scanner{
+			S3: &mockS3Error{err: &smithy.GenericAPIError{Code: "Forbidden", Message: "Access Denied"}},
+		}
+		exists, err := scanner.s3DocExists(context.Background(), "some-bucket", "some-infra")
+		if err == nil {
+			t.Fatal("expected error for 403 response")
+		}
+		if exists {
+			t.Error("expected exists=false for 403 response")
+		}
+	})
+
+	t.Run("When S3 returns 404 NotFound, s3DocExists should return false without error", func(t *testing.T) {
+		scanner := &Scanner{
+			S3: &mockS3Error{err: &smithy.GenericAPIError{Code: "NotFound", Message: "not found"}},
+		}
+		exists, err := scanner.s3DocExists(context.Background(), "some-bucket", "some-infra")
+		if err != nil {
+			t.Fatalf("unexpected error for 404 response: %v", err)
+		}
+		if exists {
+			t.Error("expected exists=false for 404 response")
+		}
+	})
+
+	t.Run("When S3 returns NoSuchKey, s3DocExists should return false without error", func(t *testing.T) {
+		scanner := &Scanner{
+			S3: &mockS3Error{err: &smithy.GenericAPIError{Code: "NoSuchKey", Message: "The specified key does not exist."}},
+		}
+		exists, err := scanner.s3DocExists(context.Background(), "some-bucket", "some-infra")
+		if err != nil {
+			t.Fatalf("unexpected error for NoSuchKey response: %v", err)
+		}
+		if exists {
+			t.Error("expected exists=false for NoSuchKey response")
+		}
+	})
+
+	t.Run("When S3 object exists, s3DocExists should return true", func(t *testing.T) {
+		scanner := &Scanner{
+			S3: &mockS3{existingKeys: map[string]bool{
+				"my-bucket/my-infra/.well-known/openid-configuration": true,
+			}},
+		}
+		exists, err := scanner.s3DocExists(context.Background(), "my-bucket", "my-infra")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !exists {
+			t.Error("expected exists=true when object exists")
+		}
+	})
+}
+
 func TestCheckOIDCFromTrustPolicy(t *testing.T) {
 	t.Run("When trust policy contains S3 OIDC issuer URL, it should extract bucket and region", func(t *testing.T) {
 		trustPolicy := `{
@@ -1665,15 +1907,15 @@ func TestCheckOIDCFromTrustPolicy(t *testing.T) {
 		}
 
 		scanner := &Scanner{IAM: iamClient}
-		bucket, region, found := scanner.checkOIDCFromTrustPolicy(context.Background(), []string{"test-infra-cloud-controller"})
+		tp, found := scanner.checkOIDCFromTrustPolicy(context.Background(), []string{"test-infra-cloud-controller"})
 		if !found {
 			t.Fatal("expected to find OIDC info in trust policy")
 		}
-		if bucket != "hypershift-ci-2-oidc" {
-			t.Errorf("expected bucket 'hypershift-ci-2-oidc', got %q", bucket)
+		if tp.Bucket != "hypershift-ci-2-oidc" {
+			t.Errorf("expected bucket 'hypershift-ci-2-oidc', got %q", tp.Bucket)
 		}
-		if region != "us-east-1" {
-			t.Errorf("expected region 'us-east-1', got %q", region)
+		if tp.Region != "us-east-1" {
+			t.Errorf("expected region 'us-east-1', got %q", tp.Region)
 		}
 	})
 
@@ -1698,7 +1940,7 @@ func TestCheckOIDCFromTrustPolicy(t *testing.T) {
 		}
 
 		scanner := &Scanner{IAM: iamClient}
-		_, _, found := scanner.checkOIDCFromTrustPolicy(context.Background(), []string{"some-role"})
+		_, found := scanner.checkOIDCFromTrustPolicy(context.Background(), []string{"some-role"})
 		if found {
 			t.Error("expected not found when trust policy has no OIDC info")
 		}
@@ -1707,9 +1949,199 @@ func TestCheckOIDCFromTrustPolicy(t *testing.T) {
 	t.Run("When role does not exist, it should return not found", func(t *testing.T) {
 		iamClient := &mockIAM{}
 		scanner := &Scanner{IAM: iamClient}
-		_, _, found := scanner.checkOIDCFromTrustPolicy(context.Background(), []string{"nonexistent-role"})
+		_, found := scanner.checkOIDCFromTrustPolicy(context.Background(), []string{"nonexistent-role"})
 		if found {
 			t.Error("expected not found for nonexistent role")
+		}
+	})
+
+	t.Run("When trust policy uses dualstack S3 URL, it should extract bucket and region", func(t *testing.T) {
+		trustPolicy := `{
+			"Version": "2012-10-17",
+			"Statement": [{
+				"Effect": "Allow",
+				"Principal": {"Federated": "arn:aws:iam::123456789012:oidc-provider/my-oidc.s3.dualstack.eu-west-1.amazonaws.com/infra123"},
+				"Action": "sts:AssumeRoleWithWebIdentity",
+				"Condition": {
+					"StringEquals": {
+						"my-oidc.s3.dualstack.eu-west-1.amazonaws.com/infra123:sub": "system:serviceaccount:kube-system:cpo"
+					}
+				}
+			}]
+		}`
+		encodedPolicy := url.QueryEscape(trustPolicy)
+
+		iamClient := &mockIAM{
+			roleMap: map[string]*iamtypes.Role{
+				"test-role": {
+					RoleName:                 aws.String("test-role"),
+					AssumeRolePolicyDocument: aws.String(encodedPolicy),
+				},
+			},
+		}
+
+		scanner := &Scanner{IAM: iamClient}
+		tp, found := scanner.checkOIDCFromTrustPolicy(context.Background(), []string{"test-role"})
+		if !found {
+			t.Fatal("expected to find OIDC info in trust policy")
+		}
+		if tp.Bucket != "my-oidc" {
+			t.Errorf("expected bucket 'my-oidc', got %q", tp.Bucket)
+		}
+		if tp.Region != "eu-west-1" {
+			t.Errorf("expected region 'eu-west-1', got %q", tp.Region)
+		}
+	})
+
+	t.Run("When trust policy uses legacy s3.amazonaws.com path-style, it should extract bucket with us-east-1", func(t *testing.T) {
+		trustPolicy := `{
+			"Version": "2012-10-17",
+			"Statement": [{
+				"Effect": "Allow",
+				"Principal": {"Federated": "arn:aws:iam::123456789012:oidc-provider/s3.amazonaws.com/my-bucket/infra123"},
+				"Action": "sts:AssumeRoleWithWebIdentity",
+				"Condition": {
+					"StringEquals": {
+						"s3.amazonaws.com/my-bucket/infra123:sub": "system:serviceaccount:kube-system:cpo"
+					}
+				}
+			}]
+		}`
+		encodedPolicy := url.QueryEscape(trustPolicy)
+
+		iamClient := &mockIAM{
+			roleMap: map[string]*iamtypes.Role{
+				"test-role": {
+					RoleName:                 aws.String("test-role"),
+					AssumeRolePolicyDocument: aws.String(encodedPolicy),
+				},
+			},
+		}
+
+		scanner := &Scanner{IAM: iamClient}
+		tp, found := scanner.checkOIDCFromTrustPolicy(context.Background(), []string{"test-role"})
+		if !found {
+			t.Fatal("expected to find OIDC info in trust policy")
+		}
+		if tp.Bucket != "my-bucket" {
+			t.Errorf("expected bucket 'my-bucket', got %q", tp.Bucket)
+		}
+		if tp.Region != "us-east-1" {
+			t.Errorf("expected region 'us-east-1', got %q", tp.Region)
+		}
+	})
+
+	t.Run("When trust policy uses China region .com.cn suffix, it should extract bucket and region", func(t *testing.T) {
+		trustPolicy := `{
+			"Version": "2012-10-17",
+			"Statement": [{
+				"Effect": "Allow",
+				"Principal": {"Federated": "arn:aws-cn:iam::123456789012:oidc-provider/my-oidc.s3.cn-north-1.amazonaws.com.cn/infra123"},
+				"Action": "sts:AssumeRoleWithWebIdentity",
+				"Condition": {
+					"StringEquals": {
+						"my-oidc.s3.cn-north-1.amazonaws.com.cn/infra123:sub": "system:serviceaccount:kube-system:cpo"
+					}
+				}
+			}]
+		}`
+		encodedPolicy := url.QueryEscape(trustPolicy)
+
+		iamClient := &mockIAM{
+			roleMap: map[string]*iamtypes.Role{
+				"test-role": {
+					RoleName:                 aws.String("test-role"),
+					AssumeRolePolicyDocument: aws.String(encodedPolicy),
+				},
+			},
+		}
+
+		scanner := &Scanner{IAM: iamClient}
+		tp, found := scanner.checkOIDCFromTrustPolicy(context.Background(), []string{"test-role"})
+		if !found {
+			t.Fatal("expected to find OIDC info in trust policy")
+		}
+		if tp.Bucket != "my-oidc" {
+			t.Errorf("expected bucket 'my-oidc', got %q", tp.Bucket)
+		}
+		if tp.Region != "cn-north-1" {
+			t.Errorf("expected region 'cn-north-1', got %q", tp.Region)
+		}
+	})
+
+	t.Run("When trust policy Statement is a single object (not array), it should still parse", func(t *testing.T) {
+		trustPolicy := `{
+			"Version": "2012-10-17",
+			"Statement": {
+				"Effect": "Allow",
+				"Principal": {"Federated": "arn:aws:iam::123456789012:oidc-provider/my-oidc.s3.us-west-2.amazonaws.com/infra-single"},
+				"Action": "sts:AssumeRoleWithWebIdentity",
+				"Condition": {
+					"StringEquals": {
+						"my-oidc.s3.us-west-2.amazonaws.com/infra-single:sub": "system:serviceaccount:kube-system:cpo"
+					}
+				}
+			}
+		}`
+		encodedPolicy := url.QueryEscape(trustPolicy)
+
+		iamClient := &mockIAM{
+			roleMap: map[string]*iamtypes.Role{
+				"test-role": {
+					RoleName:                 aws.String("test-role"),
+					AssumeRolePolicyDocument: aws.String(encodedPolicy),
+				},
+			},
+		}
+
+		scanner := &Scanner{IAM: iamClient}
+		tp, found := scanner.checkOIDCFromTrustPolicy(context.Background(), []string{"test-role"})
+		if !found {
+			t.Fatal("expected to find OIDC info in trust policy with single-object Statement")
+		}
+		if tp.Bucket != "my-oidc" {
+			t.Errorf("expected bucket 'my-oidc', got %q", tp.Bucket)
+		}
+		if tp.Region != "us-west-2" {
+			t.Errorf("expected region 'us-west-2', got %q", tp.Region)
+		}
+	})
+
+	t.Run("When trust policy uses non-S3 OIDC issuer, it should return URL", func(t *testing.T) {
+		trustPolicy := `{
+			"Version": "2012-10-17",
+			"Statement": [{
+				"Effect": "Allow",
+				"Principal": {"Federated": "arn:aws:iam::123456789012:oidc-provider/oidc.op1.openshiftapps.com/infra-ns3"},
+				"Action": "sts:AssumeRoleWithWebIdentity",
+				"Condition": {
+					"StringEquals": {
+						"oidc.op1.openshiftapps.com/infra-ns3:sub": "system:serviceaccount:kube-system:cpo"
+					}
+				}
+			}]
+		}`
+		encodedPolicy := url.QueryEscape(trustPolicy)
+
+		iamClient := &mockIAM{
+			roleMap: map[string]*iamtypes.Role{
+				"test-role": {
+					RoleName:                 aws.String("test-role"),
+					AssumeRolePolicyDocument: aws.String(encodedPolicy),
+				},
+			},
+		}
+
+		scanner := &Scanner{IAM: iamClient}
+		tp, found := scanner.checkOIDCFromTrustPolicy(context.Background(), []string{"test-role"})
+		if !found {
+			t.Fatal("expected to find OIDC info for non-S3 issuer in trust policy")
+		}
+		if tp.Bucket != "" {
+			t.Errorf("expected empty bucket for non-S3 issuer, got %q", tp.Bucket)
+		}
+		if tp.URL == "" {
+			t.Error("expected non-empty URL for non-S3 issuer")
 		}
 	})
 }
@@ -1790,6 +2222,123 @@ func TestOrphanedTrustPolicyFallback(t *testing.T) {
 		}
 		if found.Verdict != VerdictActive {
 			t.Errorf("got verdict %q, want ACTIVE (reason: %s)", found.Verdict, found.VerdictReason)
+		}
+	})
+
+	t.Run("When orphaned trust policy references different region, it should be UNCERTAIN", func(t *testing.T) {
+		now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+		oldRoleDate := now.Add(-48 * time.Hour)
+
+		trustPolicy := `{
+			"Version": "2012-10-17",
+			"Statement": [{
+				"Effect": "Allow",
+				"Principal": {"Federated": "arn:aws:iam::123456789012:oidc-provider/hypershift-ci-oidc.s3.eu-west-1.amazonaws.com/orphan-infra"},
+				"Action": "sts:AssumeRoleWithWebIdentity",
+				"Condition": {
+					"StringEquals": {
+						"hypershift-ci-oidc.s3.eu-west-1.amazonaws.com/orphan-infra:sub": "system:serviceaccount:kube-system:control-plane-operator"
+					}
+				}
+			}]
+		}`
+		encodedPolicy := url.QueryEscape(trustPolicy)
+
+		scanner := &Scanner{
+			EC2:     &mockEC2{},
+			ELBv2:   &mockELBv2{},
+			Route53: &mockRoute53{},
+			IAM: &mockIAM{
+				roles: []iamtypes.Role{
+					{RoleName: aws.String("create-cluster-reg12-cloud-controller"), CreateDate: &oldRoleDate},
+				},
+				roleMap: map[string]*iamtypes.Role{
+					"create-cluster-reg12-cloud-controller": {
+						RoleName:                 aws.String("create-cluster-reg12-cloud-controller"),
+						AssumeRolePolicyDocument: aws.String(encodedPolicy),
+					},
+				},
+			},
+			S3:      &mockS3{existingKeys: map[string]bool{}},
+			Config:  DefaultConfig(), // Region = "us-east-1"
+			Now:     func() time.Time { return now },
+		}
+
+		knownInfraIDs := map[string]bool{}
+		oidcMap := map[string]oidcProviderInfo{}
+
+		orphaned, err := scanner.scanOrphanedResources(context.Background(), knownInfraIDs, oidcMap)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var found *InfraSet
+		for i := range orphaned {
+			if orphaned[i].InfraID == "create-cluster-reg12" {
+				found = &orphaned[i]
+			}
+		}
+		if found == nil {
+			t.Fatal("expected to find orphaned infra set 'create-cluster-reg12'")
+		}
+		if found.Verdict != VerdictUncertain {
+			t.Errorf("got verdict %q, want UNCERTAIN (reason: %s)", found.Verdict, found.VerdictReason)
+		}
+	})
+
+	t.Run("When orphaned IAM roles have no OIDC reference in trust policy, it should be UNCERTAIN", func(t *testing.T) {
+		now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+		oldRoleDate := now.Add(-48 * time.Hour)
+
+		trustPolicy := `{
+			"Version": "2012-10-17",
+			"Statement": [{
+				"Effect": "Allow",
+				"Principal": {"Service": "ec2.amazonaws.com"},
+				"Action": "sts:AssumeRole"
+			}]
+		}`
+		encodedPolicy := url.QueryEscape(trustPolicy)
+
+		scanner := &Scanner{
+			EC2:     &mockEC2{},
+			ELBv2:   &mockELBv2{},
+			Route53: &mockRoute53{},
+			IAM: &mockIAM{
+				roles: []iamtypes.Role{
+					{RoleName: aws.String("create-cluster-ntp12-cloud-controller"), CreateDate: &oldRoleDate},
+				},
+				roleMap: map[string]*iamtypes.Role{
+					"create-cluster-ntp12-cloud-controller": {
+						RoleName:                 aws.String("create-cluster-ntp12-cloud-controller"),
+						AssumeRolePolicyDocument: aws.String(encodedPolicy),
+					},
+				},
+			},
+			S3:      &mockS3{existingKeys: map[string]bool{}},
+			Config:  DefaultConfig(),
+			Now:     func() time.Time { return now },
+		}
+
+		knownInfraIDs := map[string]bool{}
+		oidcMap := map[string]oidcProviderInfo{}
+
+		orphaned, err := scanner.scanOrphanedResources(context.Background(), knownInfraIDs, oidcMap)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var found *InfraSet
+		for i := range orphaned {
+			if orphaned[i].InfraID == "create-cluster-ntp12" {
+				found = &orphaned[i]
+			}
+		}
+		if found == nil {
+			t.Fatal("expected to find orphaned infra set 'create-cluster-ntp12'")
+		}
+		if found.Verdict != VerdictUncertain {
+			t.Errorf("got verdict %q, want UNCERTAIN (reason: %s)", found.Verdict, found.VerdictReason)
 		}
 	})
 }
